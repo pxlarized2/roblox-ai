@@ -1,7 +1,6 @@
 // ============================================================
-//  RobloxAI Proxy Server
+//  RobloxAI Proxy Server v3
 //  npm install express cors node-fetch dotenv
-//  node server.js
 // ============================================================
 require("dotenv").config();
 const express = require("express");
@@ -13,28 +12,95 @@ app.use(express.json());
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3000;
 
-async function fetchJson(url) {
+async function fetchJson(url, options = {}) {
   const { default: fetch } = await import("node-fetch");
-  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  const res = await fetch(url, {
+    ...options,
+    headers: { "Accept": "application/json", ...(options.headers || {}) }
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
   return res.json();
 }
 
-async function askClaude(query) {
+// ── Search Roblox directly ────────────────────────────────────
+async function searchRoblox(query) {
+  try {
+    // Roblox Games search API
+    const encoded = encodeURIComponent(query);
+    const data = await fetchJson(
+      `https://games.roblox.com/v1/games/list?model.keyword=${encoded}&model.startRows=0&model.maxRows=18&model.hasVerifiedCreator=false`
+    );
+    return (data.games || []).map(g => ({
+      placeId: g.placeId,
+      universeId: g.universeId,
+      name: g.name,
+      playerCount: g.playerCount,
+      totalUpVotes: g.totalUpVotes,
+      totalDownVotes: g.totalDownVotes,
+    }));
+  } catch (err) {
+    console.warn("Roblox search failed:", err.message);
+    return [];
+  }
+}
+
+// ── Get universe ID from place ID ─────────────────────────────
+async function getUniverseId(placeId) {
+  try {
+    const data = await fetchJson(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`);
+    return data.universeId || null;
+  } catch { return null; }
+}
+
+// ── Get bulk game details ─────────────────────────────────────
+async function getGamesDetails(universeIds) {
+  try {
+    const ids = universeIds.join(",");
+    const data = await fetchJson(`https://games.roblox.com/v1/games?universeIds=${ids}`);
+    return data.data || [];
+  } catch { return []; }
+}
+
+async function getGamesVotes(universeIds) {
+  try {
+    const ids = universeIds.join(",");
+    const data = await fetchJson(`https://games.roblox.com/v1/games/votes?universeIds=${ids}`);
+    return data.data || [];
+  } catch { return []; }
+}
+
+// ── Ask Claude to pick + describe best matches ─────────────────
+async function askClaude(query, robloxResults) {
   const { default: fetch } = await import("node-fetch");
-  const prompt = `You are an expert on Roblox games. A player searched: "${query}"
 
-Return EXACTLY 6 real, popular Roblox games that best match this request.
+  let contextBlock = "";
+  if (robloxResults.length > 0) {
+    contextBlock = `\nHere are real games currently returned by Roblox's search for "${query}":\n` +
+      robloxResults.map((g, i) =>
+        `${i+1}. "${g.name}" (placeId: ${g.placeId}, universeId: ${g.universeId}, players online: ${g.playerCount || 0})`
+      ).join("\n") +
+      `\n\nPrioritize these real results. You may also add well-known games not in this list if highly relevant.`;
+  }
+
+  const prompt = `You are an expert Roblox game recommender.
+A player searched: "${query}"
+${contextBlock}
+
+Return EXACTLY 6 Roblox games best matching this search.
 For each game provide:
-- placeId    : the numeric Roblox Place ID (the number in the URL: roblox.com/games/PLACEID)
-- name       : exact game name as it appears on Roblox
-- genre      : one word genre: Adventure, Horror, Tycoon, Obby, RPG, Simulator, Battle, Roleplay, Fighting, Platformer
-- description: 2 engaging sentences about what makes this game fun
-- tags       : array of exactly 3 short tags
-- creatorName: name of the creator or group
+- placeId     : numeric Roblox Place ID
+- universeId  : numeric universe ID (use from context above if available, else estimate)  
+- name        : exact game name
+- genre       : one word: Adventure, Horror, Tycoon, Obby, RPG, Simulator, Battle, Roleplay, Fighting, Platformer, Sports, Puzzle
+- description : 2 punchy sentences about what makes this game fun and unique
+- whyMatch    : 1 sentence explaining why this matches the search query specifically
+- tags        : array of 3 short tags
+- creatorName : creator or group name
+- creatorId   : numeric creator/group ID
+- creatorType : "User" or "Group"
 
-Only include games you are highly confident exist on Roblox with accurate Place IDs.
-Respond ONLY with a raw JSON array — no markdown, no backticks, no explanation.`;
+Mix popular AND niche/hidden-gem games when relevant. Don't only pick the most famous games.
+Respond ONLY with a raw JSON array. No markdown, no backticks.`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -45,67 +111,60 @@ Respond ONLY with a raw JSON array — no markdown, no backticks, no explanation
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 1200,
+      max_tokens: 1800,
       messages: [{ role: "user", content: prompt }],
     }),
   });
 
-  if (!res.ok) throw new Error(`Claude API ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Claude ${res.status}: ${await res.text()}`);
   const data = await res.json();
   const text = data.content?.map(b => b.text || "").join("") || "";
   return JSON.parse(text.replace(/```json|```/gi, "").trim());
 }
 
-async function getRobloxData(placeId) {
-  try {
-    // Resolve place -> universe
-    const uniRes = await fetchJson(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`);
-    const universeId = uniRes.universeId;
-    if (!universeId) return null;
+// ── Ask Claude about a specific game (chat) ───────────────────
+async function askClaudeAboutGame(gameInfo, userMessage, history) {
+  const { default: fetch } = await import("node-fetch");
 
-    const [detailsRes, votesRes] = await Promise.allSettled([
-      fetchJson(`https://games.roblox.com/v1/games?universeIds=${universeId}`),
-      fetchJson(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`),
-    ]);
+  const systemPrompt = `You are an enthusiastic Roblox expert talking about the game "${gameInfo.name}" by ${gameInfo.creatorName}.
+Game info: Genre: ${gameInfo.genre}. Description: ${gameInfo.description}.
+Answer questions about this game in a helpful, conversational way. Keep answers under 3 sentences. Be specific and knowledgeable.`;
 
-    const game = detailsRes.status === "fulfilled" ? detailsRes.value?.data?.[0] : null;
-    const votes = votesRes.status === "fulfilled" ? votesRes.value?.data?.[0] : null;
+  const messages = [
+    ...(history || []),
+    { role: "user", content: userMessage }
+  ];
 
-    const up = votes?.upVotes || 0;
-    const down = votes?.downVotes || 0;
-    const total = up + down;
-    const rating = total > 0 ? Math.round((up / total) * 100) : null;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 300,
+      system: systemPrompt,
+      messages,
+    }),
+  });
 
-    function fmt(n) {
-      if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-      if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-      if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-      return String(n);
-    }
-
-    // Get creator avatar asset id for rbxthumb
-    let creatorAvatarId = null;
-    const creatorId = game?.creator?.id;
-    const creatorType = game?.creator?.type;
-
-    return {
-      universeId,       // ← KEY: Roblox client uses this for rbxthumb:// URIs
-      placeId,
-      playing: game?.playing != null ? fmt(game.playing) : null,
-      visits: game?.visits != null ? fmt(game.visits) : null,
-      rating,
-      creatorName: game?.creator?.name || null,
-      creatorId: creatorId || null,
-      creatorType: creatorType || null,
-      maxPlayers: game?.maxPlayers || null,
-    };
-  } catch (err) {
-    console.warn(`getRobloxData failed for ${placeId}:`, err.message);
-    return null;
-  }
+  if (!res.ok) throw new Error(`Claude ${res.status}`);
+  const data = await res.json();
+  return data.content?.[0]?.text || "I'm not sure about that!";
 }
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "RobloxAI" }));
+function fmt(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+
+// ── Routes ────────────────────────────────────────────────────
+app.get("/", (req, res) => res.json({ status: "ok", service: "RobloxAI v3" }));
 
 app.post("/search", async (req, res) => {
   const { query } = req.body;
@@ -115,26 +174,57 @@ app.post("/search", async (req, res) => {
   console.log(`[search] "${query}"`);
 
   try {
-    const claudeGames = await askClaude(query.trim());
+    // 1. Real Roblox search in parallel with Claude
+    const [robloxResults, _] = await Promise.allSettled([
+      searchRoblox(query),
+      Promise.resolve()
+    ]);
+    const roblox = robloxResults.status === "fulfilled" ? robloxResults.value : [];
+    console.log(`  Roblox returned ${roblox.length} results`);
 
-    const enriched = await Promise.all(claudeGames.map(async (g) => {
-      const live = await getRobloxData(g.placeId);
+    // 2. Claude picks + describes best 6
+    const claudeGames = await askClaude(query.trim(), roblox);
+
+    // 3. Enrich with live Roblox data
+    const universeIds = claudeGames
+      .map(g => g.universeId)
+      .filter(Boolean);
+
+    const [details, votes] = await Promise.all([
+      universeIds.length ? getGamesDetails(universeIds) : Promise.resolve([]),
+      universeIds.length ? getGamesVotes(universeIds) : Promise.resolve([]),
+    ]);
+
+    const detailMap = {};
+    const voteMap = {};
+    details.forEach(d => { detailMap[d.id] = d; });
+    votes.forEach(v => { voteMap[v.id] = v; });
+
+    const enriched = claudeGames.map(g => {
+      const uid = g.universeId;
+      const d = uid ? detailMap[uid] : null;
+      const v = uid ? voteMap[uid] : null;
+      const up = v?.upVotes || 0;
+      const down = v?.downVotes || 0;
+      const total = up + down;
+
       return {
-        placeId:      g.placeId,
-        universeId:   live?.universeId  || null,   // for rbxthumb://
-        name:         g.name,
-        genre:        g.genre,
-        description:  g.description,
-        tags:         g.tags || [],
-        creatorName:  live?.creatorName || g.creatorName || "Unknown",
-        creatorId:    live?.creatorId   || null,
-        creatorType:  live?.creatorType || "User",
-        playing:      live?.playing     || null,
-        visits:       live?.visits      || null,
-        rating:       live?.rating      || null,
-        maxPlayers:   live?.maxPlayers  || null,
+        placeId:     g.placeId,
+        universeId:  uid || null,
+        name:        g.name,
+        genre:       g.genre,
+        description: g.description,
+        whyMatch:    g.whyMatch || "",
+        tags:        g.tags || [],
+        creatorName: d?.creator?.name || g.creatorName || "Unknown",
+        creatorId:   d?.creator?.id || g.creatorId || null,
+        creatorType: d?.creator?.type || g.creatorType || "User",
+        playing:     d?.playing != null ? fmt(d.playing) : null,
+        visits:      d?.visits  != null ? fmt(d.visits)  : null,
+        rating:      total > 0 ? Math.round((up / total) * 100) : null,
+        maxPlayers:  d?.maxPlayers || null,
       };
-    }));
+    });
 
     return res.json({ games: enriched });
   } catch (err) {
@@ -143,4 +233,19 @@ app.post("/search", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`RobloxAI proxy on :${PORT}`));
+// Chat about a specific game
+app.post("/chat", async (req, res) => {
+  const { gameInfo, message, history } = req.body;
+  if (!gameInfo || !message) return res.status(400).json({ error: "Missing fields" });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: "No API key" });
+
+  try {
+    const reply = await askClaudeAboutGame(gameInfo, message, history || []);
+    return res.json({ reply });
+  } catch (err) {
+    console.error("[chat] error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`RobloxAI proxy v3 on :${PORT}`));
